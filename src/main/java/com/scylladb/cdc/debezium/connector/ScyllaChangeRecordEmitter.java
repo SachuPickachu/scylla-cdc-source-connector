@@ -1,7 +1,7 @@
 package com.scylladb.cdc.debezium.connector;
 
-import com.scylladb.cdc.model.worker.RawChange;
 import com.scylladb.cdc.model.worker.ChangeSchema;
+import com.scylladb.cdc.model.worker.RawChange;
 import com.scylladb.cdc.model.worker.cql.Cell;
 import com.scylladb.cdc.model.worker.cql.CqlDate;
 import com.scylladb.cdc.model.worker.cql.Field;
@@ -17,84 +17,549 @@ import org.apache.kafka.connect.data.Struct;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public class ScyllaChangeRecordEmitter extends AbstractChangeRecordEmitter<ScyllaCollectionSchema> {
+public class ScyllaChangeRecordEmitter
+    extends AbstractChangeRecordEmitter<ScyllaPartition, ScyllaCollectionSchema> {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ScyllaChangeRecordEmitter.class);
 
-    private final RawChange change;
-    private final ScyllaSchema schema;
+  /**
+   * Error marker prefix used in log messages for connector errors during record emission. This
+   * marker can be searched for in logs to identify connector-level errors.
+   */
+  public static final String CONNECTOR_ERROR_MARKER = "[SCYLLA-CDC-CONNECTOR-ERROR]";
 
-    public ScyllaChangeRecordEmitter(RawChange change, OffsetContext offsetContext, ScyllaSchema schema, Clock clock) {
-        super(offsetContext, clock);
-        this.change = change;
-        this.schema = schema;
+  /** CDC column prefix for deleted column indicators. */
+  private static final String CDC_DELETED_PREFIX = "cdc$deleted_";
+
+  private static final String CDC_DELETED_ELEMENTS_PREFIX = "cdc$deleted_elements_";
+
+  private static final String CDC_PREFIX = "cdc$";
+
+  /**
+   * Safely retrieves a cell from a RawChange, returning null if an exception occurs.
+   *
+   * @param change the RawChange to get the cell from
+   * @param columnName the name of the column
+   * @return the Cell, or null if an exception occurs or the cell doesn't exist
+   */
+  private static Cell getCellSafe(RawChange change, String columnName) {
+    try {
+      return change.getCell(columnName);
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private final ScyllaSchema schema;
+  private final TaskInfo taskInfo;
+  private final ScyllaConnectorConfig connectorConfig;
+
+  public ScyllaChangeRecordEmitter(
+      ScyllaPartition partition,
+      TaskInfo taskInfo,
+      OffsetContext offsetContext,
+      ScyllaSchema schema,
+      Clock clock,
+      ScyllaConnectorConfig connectorConfig) {
+    super(partition, offsetContext, clock, connectorConfig);
+    this.taskInfo = taskInfo;
+    this.schema = schema;
+    this.connectorConfig = connectorConfig;
+  }
+
+  public ChangeSchema getChangeSchema() {
+    RawChange change = taskInfo.getAnyImage();
+    if (change == null) {
+      return null;
+    }
+    return change.getSchema();
+  }
+
+  public ScyllaSchema getSchema() {
+    return schema;
+  }
+
+  @Override
+  public Envelope.Operation getOperation() {
+    RawChange.OperationType operationType = taskInfo.getChange().getOperationType();
+    switch (operationType) {
+      case ROW_UPDATE:
+        return Envelope.Operation.UPDATE;
+      case ROW_INSERT:
+        return Envelope.Operation.CREATE;
+      case PARTITION_DELETE: // See comment in ScyllaChangesConsumer on the support of partition
+      // deletes.
+      case ROW_DELETE:
+        return Envelope.Operation.DELETE;
+      default:
+        String errorMsg = String.format("Unsupported operation type: %s.", operationType);
+        LOGGER.error("{} {}", CONNECTOR_ERROR_MARKER, errorMsg);
+        throw new RuntimeException(errorMsg);
+    }
+  }
+
+  @Override
+  protected void emitReadRecord(Receiver receiver, ScyllaCollectionSchema scyllaCollectionSchema)
+      throws InterruptedException {
+    throw new UnsupportedOperationException();
+  }
+
+  /**
+   * Builds the keyStruct with primary key values from the best available source.
+   *
+   * <p>Prefers postImage over preImage, falling back to the change record if neither is available.
+   *
+   * @param keySchema the schema for the key struct
+   * @param anyImage the image to extract key values from
+   * @return the populated key struct
+   */
+  private Struct createKeyStruct(
+      Schema keySchema, RawChange anyImage, ScyllaCollectionSchema collectionSchema) {
+    if (!includePkInKafkaKey()) {
+      return null;
+    }
+    Struct keyStruct = new Struct(keySchema);
+    fillKeyStructFromImage(keyStruct, anyImage, collectionSchema);
+    return keyStruct;
+  }
+
+  private ScyllaCollectionSchema getOrCreateSchema(
+      ScyllaCollectionSchema scyllaCollectionSchema, RawChange anyImage) {
+    if (anyImage == null) {
+      return scyllaCollectionSchema;
+    }
+    return this.schema.updateChangeSchema(scyllaCollectionSchema.id(), anyImage.getSchema());
+  }
+
+  @Override
+  protected void emitCreateRecord(
+      Receiver<ScyllaPartition> receiver, ScyllaCollectionSchema scyllaCollectionSchema)
+      throws InterruptedException {
+    RawChange anyImage = taskInfo.getAnyImage();
+    scyllaCollectionSchema = getOrCreateSchema(scyllaCollectionSchema, anyImage);
+
+    // Build Kafka record key based on configuration
+    Struct keyStruct =
+        createKeyStruct(scyllaCollectionSchema.keySchema(), anyImage, scyllaCollectionSchema);
+
+    // Build after struct with PK based on configuration
+    Struct afterStruct =
+        fillStructWithFullImage(
+            scyllaCollectionSchema.afterSchema(),
+            taskInfo.getPostImage(),
+            includePkInPayloadAfter(),
+            scyllaCollectionSchema);
+
+    // Build before struct with PK based on configuration
+    Struct beforeStruct =
+        fillStructWithFullImage(
+            scyllaCollectionSchema.beforeSchema(),
+            taskInfo.getPreImage(),
+            includePkInPayloadBefore(),
+            scyllaCollectionSchema);
+
+    Struct payloadKeyStruct =
+        fillPayloadKeyStruct(scyllaCollectionSchema.keySchema(), anyImage, scyllaCollectionSchema);
+
+    Struct envelope =
+        generalizedEnvelope(
+            scyllaCollectionSchema.getEnvelopeSchema().schema(),
+            beforeStruct,
+            afterStruct,
+            payloadKeyStruct,
+            null,
+            getOffset().getSourceInfo(),
+            getClock().currentTimeAsInstant(),
+            Envelope.Operation.CREATE);
+
+    // Build Kafka headers if configured
+    ConnectHeaders headers = buildPkHeaders(anyImage, scyllaCollectionSchema);
+
+    receiver.changeRecord(
+        getPartition(),
+        scyllaCollectionSchema,
+        getOperation(),
+        keyStruct,
+        envelope,
+        getOffset(),
+        headers);
+  }
+
+  @Override
+  protected void emitUpdateRecord(
+      Receiver<ScyllaPartition> receiver, ScyllaCollectionSchema scyllaCollectionSchema)
+      throws InterruptedException {
+    RawChange anyImage = taskInfo.getAnyImage();
+    scyllaCollectionSchema = getOrCreateSchema(scyllaCollectionSchema, anyImage);
+
+    // Build Kafka record key based on configuration
+    Struct keyStruct =
+        createKeyStruct(scyllaCollectionSchema.keySchema(), anyImage, scyllaCollectionSchema);
+
+    ScyllaConnectorConfig.CdcIncludeMode beforeMode = connectorConfig.getCdcIncludeBefore();
+    ScyllaConnectorConfig.CdcIncludeMode afterMode = connectorConfig.getCdcIncludeAfter();
+
+    Struct afterStruct;
+    Struct beforeStruct;
+    Set<String> modifiedColumns = getModifiedColumns(taskInfo.getChange());
+
+    if (beforeMode == ScyllaConnectorConfig.CdcIncludeMode.ONLY_UPDATED
+        || afterMode == ScyllaConnectorConfig.CdcIncludeMode.ONLY_UPDATED) {
+
+      if (afterMode == ScyllaConnectorConfig.CdcIncludeMode.ONLY_UPDATED) {
+        afterStruct =
+            fillStructWithOnlyUpdatedColumns(
+                scyllaCollectionSchema.afterSchema(),
+                taskInfo.getPostImage(),
+                modifiedColumns,
+                includePkInPayloadAfter(),
+                scyllaCollectionSchema);
+      } else {
+        afterStruct =
+            fillStructWithFullImage(
+                scyllaCollectionSchema.afterSchema(),
+                taskInfo.getPostImage(),
+                includePkInPayloadAfter(),
+                scyllaCollectionSchema);
+      }
+
+      if (beforeMode == ScyllaConnectorConfig.CdcIncludeMode.ONLY_UPDATED) {
+        beforeStruct =
+            fillStructWithOnlyUpdatedColumns(
+                scyllaCollectionSchema.beforeSchema(),
+                taskInfo.getPreImage(),
+                modifiedColumns,
+                includePkInPayloadBefore(),
+                scyllaCollectionSchema);
+      } else {
+        beforeStruct =
+            fillBeforeStructForUpdate(
+                scyllaCollectionSchema,
+                taskInfo.getPreImage(),
+                taskInfo.getPostImage(),
+                includePkInPayloadBefore(),
+                modifiedColumns);
+      }
+    } else {
+      // Original behavior for FULL/NONE modes
+      afterStruct =
+          fillStructWithFullImage(
+              scyllaCollectionSchema.afterSchema(),
+              taskInfo.getPostImage(),
+              includePkInPayloadAfter(),
+              scyllaCollectionSchema);
+
+      beforeStruct =
+          fillBeforeStructForUpdate(
+              scyllaCollectionSchema,
+              taskInfo.getPreImage(),
+              taskInfo.getPostImage(),
+              includePkInPayloadBefore(),
+              modifiedColumns);
     }
 
-    public RawChange getChange() {
-        return change;
+    Struct payloadKeyStruct =
+        fillPayloadKeyStruct(scyllaCollectionSchema.keySchema(), anyImage, scyllaCollectionSchema);
+
+    Struct envelope =
+        generalizedEnvelope(
+            scyllaCollectionSchema.getEnvelopeSchema().schema(),
+            beforeStruct,
+            afterStruct,
+            payloadKeyStruct,
+            null,
+            getOffset().getSourceInfo(),
+            getClock().currentTimeAsInstant(),
+            Envelope.Operation.UPDATE);
+
+    // Build Kafka headers if configured
+    ConnectHeaders headers = buildPkHeaders(anyImage, scyllaCollectionSchema);
+
+    receiver.changeRecord(
+        getPartition(),
+        scyllaCollectionSchema,
+        getOperation(),
+        keyStruct,
+        envelope,
+        getOffset(),
+        headers);
+  }
+
+  @Override
+  protected void emitDeleteRecord(
+      Receiver<ScyllaPartition> receiver, ScyllaCollectionSchema scyllaCollectionSchema)
+      throws InterruptedException {
+    RawChange preImage = taskInfo.getPreImage();
+    RawChange anyImage = taskInfo.getAnyImage();
+
+    scyllaCollectionSchema = getOrCreateSchema(scyllaCollectionSchema, anyImage);
+    Struct keyStruct =
+        createKeyStruct(scyllaCollectionSchema.keySchema(), anyImage, scyllaCollectionSchema);
+
+    // Build before struct with PK based on configuration
+    Struct beforeStruct =
+        fillStructWithFullImage(
+            scyllaCollectionSchema.beforeSchema(),
+            preImage,
+            includePkInPayloadBefore(),
+            scyllaCollectionSchema);
+
+    Struct payloadKeyStruct =
+        fillPayloadKeyStruct(scyllaCollectionSchema.keySchema(), anyImage, scyllaCollectionSchema);
+
+    Struct envelope =
+        generalizedEnvelope(
+            scyllaCollectionSchema.getEnvelopeSchema().schema(),
+            beforeStruct,
+            null,
+            payloadKeyStruct,
+            null,
+            getOffset().getSourceInfo(),
+            getClock().currentTimeAsInstant(),
+            Envelope.Operation.DELETE);
+
+    // Build Kafka headers if configured (use same fallback as payloadKeyStruct)
+    ConnectHeaders headers = buildPkHeaders(anyImage, scyllaCollectionSchema);
+
+    receiver.changeRecord(
+        getPartition(),
+        scyllaCollectionSchema,
+        getOperation(),
+        keyStruct,
+        envelope,
+        getOffset(),
+        headers);
+  }
+
+  /**
+   * Gets the set of column names that were modified in an update operation.
+   *
+   * <p>Scylla CDC change records contain information about which columns were modified:
+   *
+   * <ul>
+   *   <li>Columns with non-null values in the change record were set to a new value
+   *   <li>Columns with {@code cdc$deleted_<column>} = true were explicitly set to NULL
+   * </ul>
+   *
+   * <p>This method combines both indicators to correctly identify all modified columns, including
+   * NULL to value transitions.
+   *
+   * @param change the change record containing column values and cdc$deleted_* indicators
+   * @return set of modified column names, or empty set if change is null
+   */
+  private Set<String> getModifiedColumns(RawChange change) {
+    if (change == null) {
+      return Collections.emptySet();
     }
 
-    public ScyllaSchema getSchema() {
-        return schema;
-    }
+    Set<String> modifiedColumns = new HashSet<>();
+    for (ChangeSchema.ColumnDefinition cdef : change.getSchema().getNonCdcColumnDefinitions()) {
+      if (isPrimaryKeyColumn(cdef)) {
+        continue;
+      }
+      String columnName = cdef.getColumnName();
 
-    @Override
-    protected Envelope.Operation getOperation() {
-        RawChange.OperationType operationType = this.change.getOperationType();
-        switch (operationType) {
-            case ROW_UPDATE:
-                return Envelope.Operation.UPDATE;
-            case ROW_INSERT:
-                return Envelope.Operation.CREATE;
-            case PARTITION_DELETE: // See comment in ScyllaChangesConsumer on the support of partition deletes.
-            case ROW_DELETE:
-                return Envelope.Operation.DELETE;
-            default:
-                throw new RuntimeException(String.format("Unsupported operation type: %s.", operationType));
+      if (columnName.startsWith(CDC_PREFIX)) {
+        continue;
+      }
+      // Check if column has a new value (was set to a non-null value)
+      Cell valueCell = getCellSafe(change, columnName);
+      if (valueCell != null && valueCell.getAsObject() != null) {
+        modifiedColumns.add(columnName);
+        continue;
+      }
+
+      // Check if column was explicitly deleted (set to NULL)
+      Cell deletedCell = getCellSafe(change, CDC_DELETED_PREFIX + columnName);
+      if (deletedCell != null && Boolean.TRUE.equals(deletedCell.getBoolean())) {
+        modifiedColumns.add(columnName);
+        continue;
+      }
+
+      // Check if collection has deleted elements (for non-frozen collections)
+      // cdc$deleted_elements_<col> only exists for non-frozen LIST, SET, and MAP columns
+      Cell deletedElementsCell = getCellSafe(change, CDC_DELETED_ELEMENTS_PREFIX + columnName);
+      if (deletedElementsCell != null && deletedElementsCell.getAsObject() != null) {
+        modifiedColumns.add(columnName);
+      }
+    }
+    return modifiedColumns;
+  }
+
+  /**
+   * Fills only the key struct with primary key values from an image.
+   *
+   * <p>Iterates over the key schema fields in order (which should be partition keys first, then
+   * clustering keys) to ensure proper ordering of the primary key columns.
+   *
+   * @param keyStruct the key struct to fill
+   * @param image the preimage or postimage to get primary key values from
+   */
+  private void fillKeyStructFromImage(
+      Struct keyStruct, RawChange image, ScyllaCollectionSchema collectionSchema) {
+    // Iterate over key schema fields in order to maintain proper PK column ordering
+    for (org.apache.kafka.connect.data.Field field : keyStruct.schema().fields()) {
+      String columnName = field.name();
+      Cell cell = getCellSafe(image, columnName);
+      if (cell != null) {
+        Object value = translateCellToKafka(cell, collectionSchema.cellSchema(columnName));
+        keyStruct.put(columnName, value);
+      }
+    }
+  }
+
+  /**
+   * Builds and fills a value struct with only the modified columns from an image.
+   *
+   * <p>This method is used for the 'only-updated' mode, where only columns that were modified by
+   * the operation are included in the before/after structs. Primary key columns are included based
+   * on the includePk parameter.
+   *
+   * @param structSchema the schema to use for creating the struct (beforeSchema or afterSchema)
+   * @param image the image (preimage or postimage) containing the data
+   * @param modifiedColumns the set of column names that were modified
+   * @param includePk whether to include primary key columns
+   * @return the populated struct with only modified columns, or null if image is null
+   */
+  private Struct fillStructWithOnlyUpdatedColumns(
+      Schema structSchema,
+      RawChange image,
+      Set<String> modifiedColumns,
+      boolean includePk,
+      ScyllaCollectionSchema collectionSchema) {
+    if (image == null) {
+      return null;
+    }
+    Struct valueStruct = new Struct(structSchema);
+    boolean legacyFormat =
+        connectorConfig.getCdcOutputFormat()
+            == ScyllaConnectorConfig.CdcOutputFormat.LEGACY;
+
+    for (ChangeSchema.ColumnDefinition cdef : image.getSchema().getNonCdcColumnDefinitions()) {
+      String columnName = cdef.getColumnName();
+      if (!ScyllaSchema.isSupportedColumnSchema(image.getSchema(), cdef)) {
+        continue;
+      }
+
+      if (isPrimaryKeyColumn(cdef)) {
+        if (includePk) {
+          Object value =
+              translateCellToKafka(
+                  getCellSafe(image, columnName), collectionSchema.cellSchema(columnName));
+          valueStruct.put(columnName, value);
         }
+        continue;
+      }
+
+      if (!modifiedColumns.contains(columnName)) {
+        continue;
+      }
+
+      // Non-PK, modified: legacy = Cell wrapping; advanced = raw values
+      if (legacyFormat) {
+        if (ScyllaSchema.isNonFrozenCollection(image.getSchema(), cdef)) {
+          Struct cellOrNull =
+              translateNonFrozenCollectionToKafka(
+                  valueStruct, image, collectionSchema.cellSchema(columnName), cdef);
+          valueStruct.put(columnName, cellOrNull);
+        } else {
+          Object value =
+              translateCellToKafka(
+                  getCellSafe(image, columnName), collectionSchema.cellSchema(columnName));
+          Schema cellSchema = collectionSchema.cellSchema(columnName);
+          Struct cell = new Struct(cellSchema);
+          cell.put(ScyllaSchema.CELL_VALUE, value);
+          valueStruct.put(columnName, cell);
+        }
+      } else {
+        if (ScyllaSchema.isNonFrozenCollection(image.getSchema(), cdef)) {
+          Struct cell =
+              translateNonFrozenCollectionToKafka(
+                  valueStruct, image, collectionSchema.cellSchema(columnName), cdef);
+          valueStruct.put(columnName, cell != null ? cell.get(ScyllaSchema.CELL_VALUE) : null);
+        } else {
+          Object value =
+              translateCellToKafka(
+                  getCellSafe(image, columnName), collectionSchema.cellSchema(columnName));
+          valueStruct.put(columnName, value);
+        }
+      }
     }
+    return valueStruct;
+  }
 
-    @Override
-    protected void emitReadRecord(Receiver receiver, ScyllaCollectionSchema scyllaCollectionSchema) throws InterruptedException {
-        throw new UnsupportedOperationException();
+  /**
+   * Builds and fills a value struct with data from a full image (preimage or postimage). This
+   * method doesn't check cdc$deleted_ columns because preimage/postimage contain complete row data
+   * with all column values.
+   *
+   * @param structSchema the schema to use for creating the struct (beforeSchema or afterSchema)
+   * @param image the preimage or postimage containing the full row data, or null
+   * @param includePk whether to include primary key columns
+   * @param collectionSchema the collection schema for looking up cell schemas
+   * @return the populated struct, or null if image is null
+   */
+  private Struct fillStructWithFullImage(
+      Schema structSchema,
+      RawChange image,
+      boolean includePk,
+      ScyllaCollectionSchema collectionSchema) {
+    if (image == null) {
+      return null;
     }
+    Struct valueStruct = new Struct(structSchema);
+    boolean legacyFormat =
+        connectorConfig.getCdcOutputFormat()
+            == ScyllaConnectorConfig.CdcOutputFormat.LEGACY;
 
-    @Override
-    protected void emitCreateRecord(Receiver receiver, ScyllaCollectionSchema scyllaCollectionSchema) throws InterruptedException {
-        scyllaCollectionSchema = this.schema.updateChangeSchema(scyllaCollectionSchema.id(), change.getSchema());
+    for (ChangeSchema.ColumnDefinition cdef : image.getSchema().getNonCdcColumnDefinitions()) {
+      String columnName = cdef.getColumnName();
+      if (!ScyllaSchema.isSupportedColumnSchema(image.getSchema(), cdef)) {
+        continue;
+      }
 
-        Struct keyStruct = new Struct(scyllaCollectionSchema.keySchema());
-        Struct afterStruct = new Struct(scyllaCollectionSchema.afterSchema());
-        fillStructWithChange(scyllaCollectionSchema, keyStruct, afterStruct, change);
+      if (isPrimaryKeyColumn(cdef)) {
+        if (includePk) {
+          Object value =
+              translateCellToKafka(
+                  getCellSafe(image, columnName), collectionSchema.cellSchema(columnName));
+          valueStruct.put(columnName, value);
+        }
+        continue;
+      }
 
-        Struct envelope = scyllaCollectionSchema.getEnvelopeSchema().create(afterStruct, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-
-        receiver.changeRecord(scyllaCollectionSchema, getOperation(), keyStruct, envelope, getOffset(), null);
+      // Non-PK: legacy = Cell wrapping (for transform); advanced = raw values (master behaviour)
+      if (legacyFormat) {
+        if (ScyllaSchema.isNonFrozenCollection(image.getSchema(), cdef)) {
+          Struct cellOrNull =
+              translateNonFrozenCollectionToKafka(
+                  valueStruct, image, collectionSchema.cellSchema(columnName), cdef);
+          valueStruct.put(columnName, cellOrNull);
+        } else {
+          Object value =
+              translateCellToKafka(
+                  getCellSafe(image, columnName), collectionSchema.cellSchema(columnName));
+          Schema cellSchema = collectionSchema.cellSchema(columnName);
+          Struct cell = new Struct(cellSchema);
+          cell.put(ScyllaSchema.CELL_VALUE, value);
+          valueStruct.put(columnName, cell);
+        }
+      } else {
+        // ADVANCED - direct values, no Cell wrapper
+        if (ScyllaSchema.isNonFrozenCollection(image.getSchema(), cdef)) {
+          Struct cell =
+              translateNonFrozenCollectionToKafka(
+                  valueStruct, image, collectionSchema.cellSchema(columnName), cdef);
+          valueStruct.put(columnName, cell != null ? cell.get(ScyllaSchema.CELL_VALUE) : null);
+        } else {
+          Object value =
+              translateCellToKafka(
+                  getCellSafe(image, columnName), collectionSchema.cellSchema(columnName));
+          valueStruct.put(columnName, value);
+        }
+      }
     }
-
-    @Override
-    protected void emitUpdateRecord(Receiver receiver, ScyllaCollectionSchema scyllaCollectionSchema) throws InterruptedException {
-        scyllaCollectionSchema = this.schema.updateChangeSchema(scyllaCollectionSchema.id(), change.getSchema());
-
-        Struct keyStruct = new Struct(scyllaCollectionSchema.keySchema());
-        Struct afterStruct = new Struct(scyllaCollectionSchema.afterSchema());
-        fillStructWithChange(scyllaCollectionSchema, keyStruct, afterStruct, change);
-
-        Struct envelope = scyllaCollectionSchema.getEnvelopeSchema().update(null, afterStruct, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-
-        receiver.changeRecord(scyllaCollectionSchema, getOperation(), keyStruct, envelope, getOffset(), null);
-    }
-
-    @Override
-    protected void emitDeleteRecord(Receiver receiver, ScyllaCollectionSchema scyllaCollectionSchema) throws InterruptedException {
-        scyllaCollectionSchema = this.schema.updateChangeSchema(scyllaCollectionSchema.id(), change.getSchema());
-
-        Struct keyStruct = new Struct(scyllaCollectionSchema.keySchema());
-        Struct beforeStruct = new Struct(scyllaCollectionSchema.beforeSchema());
-        fillStructWithChange(scyllaCollectionSchema, keyStruct, beforeStruct, change);
-
-        Struct envelope = scyllaCollectionSchema.getEnvelopeSchema().delete(beforeStruct, getOffset().getSourceInfo(), getClock().currentTimeAsInstant());
-
-        receiver.changeRecord(scyllaCollectionSchema, getOperation(), keyStruct, envelope, getOffset(), null);
-    }
+    return valueStruct;
+  }
 
     private void fillStructWithChange(ScyllaCollectionSchema schema, Struct keyStruct, Struct valueStruct, RawChange change) {
         for (ChangeSchema.ColumnDefinition cdef : change.getSchema().getNonCdcColumnDefinitions()) {
@@ -309,4 +774,8 @@ public class ScyllaChangeRecordEmitter extends AbstractChangeRecordEmitter<Scyll
 
        return field.getAsObject();
     }
+    Struct keyStruct = new Struct(keySchema);
+    fillKeyStructFromImage(keyStruct, image, collectionSchema);
+    return keyStruct;
+  }
 }

@@ -227,8 +227,7 @@
         <flogger.version>0.5.1</flogger.version>
         <!-- added for transitive dependencies -->
         <log4j.version>2.25.4</log4j.version>
-        <jackson-databind.version>2.21.1</jackson-databind.version>
-        <jackson-core.version>2.21.1</jackson-core.version>
+        <jackson.version>2.22.1</jackson.version>
         <guava.version>33.5.0-jre</guava.version>
         <jetty.version>12.1.7</jetty.version>
         <commons.version>3.19.0</commons.version>
@@ -239,13 +238,13 @@
             <dependency>
                 <groupId>com.fasterxml.jackson.core</groupId>
                 <artifactId>jackson-databind</artifactId>
-                <version>${jackson-databind.version}</version>
+                <version>${jackson.version}</version>
             </dependency>
-            <!-- Override jackson-core pulled transitively from debezium-core to address GHSA-72hv-8253-57qq; version must match jackson-databind -->
+            <!-- Override jackson-core pulled transitively from debezium-core; keep Jackson core modules aligned. -->
             <dependency>
                 <groupId>com.fasterxml.jackson.core</groupId>
                 <artifactId>jackson-core</artifactId>
-                <version>${jackson-core.version}</version>
+                <version>${jackson.version}</version>
             </dependency>
             <dependency>
                 <groupId>org.apache.logging.log4j</groupId>

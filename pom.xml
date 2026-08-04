@@ -323,6 +323,19 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <!-- CVE-2026-59901 (netty-codec bzip2 infinite loop): force the netty family to
+                 4.1.136.Final, overriding the 4.1.135.Final that arrives via
+                 scylla-driver-core -> netty-handler. The netty copy shaded into
+                 scylla-cdc-driver3 is NOT covered by this - remove this import once a
+                 scylla-cdc-java release ships netty >= 4.1.136.Final and a matching
+                 scylla-driver-core is consumed here. -->
+            <dependency>
+                <groupId>io.netty</groupId>
+                <artifactId>netty-bom</artifactId>
+                <version>4.1.136.Final</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>io.confluent</groupId>
                 <artifactId>kafka-avro-serializer</artifactId>
@@ -379,10 +392,11 @@
                 </exclusion>
             </exclusions>
         </dependency>
+        <!-- CVE-2026-59949: JNI XXHash range validation; fixed in 1.11.1. -->
         <dependency>
             <groupId>at.yawk.lz4</groupId>
             <artifactId>lz4-java</artifactId>
-            <version>1.10.2</version>
+            <version>1.11.1</version>
         </dependency>
         <dependency>
             <groupId>io.debezium</groupId>

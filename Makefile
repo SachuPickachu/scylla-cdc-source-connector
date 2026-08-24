@@ -15,6 +15,6 @@ github-release:
 		gh release create "$(RELEASE_TAG)" \
 			"$(FAT_JAR)" \
 			"$(CONNECT_ZIP)" \
-			--title "Release $(RELEASE_VERSION)" \
+			--title "$(RELEASE_TAG)" \
 			--generate-notes; \
 	fi
